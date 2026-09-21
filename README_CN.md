@@ -124,11 +124,12 @@ VictoriaMetrics v1.150.0 的存储目录结构：
 - **Linux (amd64)**：`vmbackup-partition-linux-amd64` —— 静态编译（`CGO_ENABLED=0`），无运行时依赖
 
 ```bash
-curl -fL -o vmbackup-partition https://github.com/surenwuyuwuqiu/vmbackup-partition/releases/latest/download/vmbackup-partition-linux-amd64
+curl -fL -O https://github.com/surenwuyuwuqiu/vmbackup-partition/releases/latest/download/vmbackup-partition-linux-amd64
 curl -fL -O https://github.com/surenwuyuwuqiu/vmbackup-partition/releases/latest/download/vmbackup-partition-linux-amd64.sha256
 
 sha256sum -c vmbackup-partition-linux-amd64.sha256   # 校验完整性
-chmod +x vmbackup-partition && sudo mv vmbackup-partition /usr/local/bin/
+chmod +x vmbackup-partition-linux-amd64
+sudo mv vmbackup-partition-linux-amd64 /usr/local/bin/vmbackup-partition
 
 vmbackup-partition -version
 # vmbackup-partition v1.0.0 based-on VictoriaMetrics v1.150.0

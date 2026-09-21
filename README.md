@@ -124,11 +124,12 @@ Pre-built binaries are available from [GitHub Releases](https://github.com/suren
 - **Linux (amd64)**: `vmbackup-partition-linux-amd64` — static binary (`CGO_ENABLED=0`), no runtime dependencies
 
 ```bash
-curl -fL -o vmbackup-partition https://github.com/surenwuyuwuqiu/vmbackup-partition/releases/latest/download/vmbackup-partition-linux-amd64
+curl -fL -O https://github.com/surenwuyuwuqiu/vmbackup-partition/releases/latest/download/vmbackup-partition-linux-amd64
 curl -fL -O https://github.com/surenwuyuwuqiu/vmbackup-partition/releases/latest/download/vmbackup-partition-linux-amd64.sha256
 
 sha256sum -c vmbackup-partition-linux-amd64.sha256   # verify integrity
-chmod +x vmbackup-partition && sudo mv vmbackup-partition /usr/local/bin/
+chmod +x vmbackup-partition-linux-amd64
+sudo mv vmbackup-partition-linux-amd64 /usr/local/bin/vmbackup-partition
 
 vmbackup-partition -version
 # vmbackup-partition v1.0.0 based-on VictoriaMetrics v1.150.0
