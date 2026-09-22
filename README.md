@@ -318,6 +318,21 @@ vmrestore -src=s3://my-bucket/vm-cluster/2026H1/vmstorage-0 \
 victoria-metrics -storageDataPath=/var/lib/victoria-metrics-restored -httpListenAddr=:8428
 ```
 
+> Warning: **raise `-retentionPeriod` before starting, or the restored history will be deleted automatically.**
+> VictoriaMetrics applies retention during background merges: a part whose `MaxTimestamp` is older than
+> `now - retentionPeriod` is dropped. This backup holds **past** months, so starting with the default
+> `-retentionPeriod=1M` tells the engine to discard them right away.
+> Measured on v1.150.0: after restoring `2026_02`~`2026_06` and starting with the default retention,
+> the `2026_02`~`2026_06` partitions were all deleted within about one minute, leaving only the current month.
+> For archival, start with a value that covers the data span, e.g. `-retentionPeriod=100y`.
+> See <https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#retention>
+
+> Warning: **never restore into a data directory that is already in use.** The official docs state that when
+> `-storageDataPath` is non-empty its contents are synchronized with the backup, i.e. it behaves like
+> `rsync --delete` (<https://docs.victoriametrics.com/victoriametrics/vmrestore/>).
+> If the target node already holds the current month, restoring deletes the months absent from the backup.
+> Use an empty directory when importing into a new cluster; back up the existing directory first if you must keep it.
+
 ### Post-restore checklist
 
 ```bash

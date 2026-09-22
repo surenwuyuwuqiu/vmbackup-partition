@@ -318,6 +318,21 @@ vmrestore -src=s3://my-bucket/vm-cluster/2026H1/vmstorage-0 \
 victoria-metrics -storageDataPath=/var/lib/victoria-metrics-restored -httpListenAddr=:8428
 ```
 
+> ⚠️ **启动前必须调大 `-retentionPeriod`，否则还原的历史数据会被自动删除。**
+> VictoriaMetrics 的保留期清理在后台 merge 时生效：分区内 part 的 `MaxTimestamp` 早于
+> `now - retentionPeriod` 就会被丢弃。这份备份里装的是**过去**的月份，用默认的
+> `-retentionPeriod=1M` 启动，等于让引擎立刻把它们清空。
+> 实测（v1.150.0）：还原 `2026_02`~`2026_06` 后用默认保留期启动，约 1 分钟后
+> `2026_02`~`2026_06` 分区被全部删除，磁盘上只剩当前月。
+> 归档场景请用覆盖数据跨度的值启动，例如 `-retentionPeriod=100y`。
+> 参考：<https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#retention>
+
+> ⚠️ **不要把备份还原进一个已经在用的数据目录。** 官方文档明确：`-storageDataPath`
+> 目录非空时，其内容会被备份内容同步替换，**效果等同于 `rsync --delete`**
+> （<https://docs.victoriametrics.com/victoriametrics/vmrestore/>）。
+> 若目标节点已在承载当前月数据，还原会删掉那些备份里没有的月份。
+> 导入新集群请使用空目录；需要保留现有数据时先备份该目录。
+
 ### 还原后的验证清单
 
 ```bash

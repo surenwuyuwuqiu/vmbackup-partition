@@ -7,7 +7,8 @@
 #   make check                 fmt + vet + test
 #   make release               产出 linux amd64 二进制 + sha256 校验和
 #   make e2e-synthetic         合成快照端到端验证（需先 make build）
-#   make e2e-real              真实 VictoriaMetrics 集群端到端验证
+#   make e2e-real              真实 VictoriaMetrics 端到端验证（单节点还原）
+#   make e2e-cluster           真实 3 节点集群：按月备份 → 导入新集群 + retention 对照
 #   make clean
 
 SHELL := /bin/bash
@@ -91,6 +92,10 @@ e2e-synthetic: build
 .PHONY: e2e-real
 e2e-real: build
 	bash scripts/e2e-real.sh
+
+.PHONY: e2e-cluster
+e2e-cluster: build
+	bash scripts/e2e-cluster.sh
 
 .PHONY: clean
 clean:
