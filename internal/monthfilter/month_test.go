@@ -128,7 +128,7 @@ func TestClassify(t *testing.T) {
 		month       string
 		subDir      string
 	}{
-		// 真实布局：data/<small|big|indexdb>/<YYYY_MM>/<partID>/<file>
+		// 现代布局：data/<small|big|indexdb>/<YYYY_MM>/<partID>/<file>
 		{"data/small/2026_02/0000000000000001/timestamps.bin", true, "2026_02", "small"},
 		{"data/small/2026_02/0000000000000001/values.bin", true, "2026_02", "small"},
 		{"data/big/2026_06/0000000000000abc/index.bin", true, "2026_06", "big"},

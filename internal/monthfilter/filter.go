@@ -24,11 +24,19 @@ const (
 
 // maxPartitionProbeDepth 是在 data/ 之下探测分区目录名的最大深度。
 //
-// 当前权威布局为 data/<small|big|indexdb>/<YYYY_MM>/...（深度 1），
-// 见官方文档中的实际日志样例（docs/victoriametrics/vmctl/thanos.md）：
+// 现代布局为 data/<small|big|indexdb>/<YYYY_MM>/...（深度 1），来源：
+//   - lib/storage/storage.go:290  tablePath := filepath.Join(path, dataDirname)
+//   - lib/storage/table.go:110    indexDBPath := filepath.Join(path, indexdbDirname)
+//   - docs/victoriametrics/vmctl/thanos.md 的日志样例：
+//     creating a partition "2025_04" with smallPartsPath=".../data/small/2025_04",
+//     bigPartsPath=".../data/big/2025_04"
 //
-//	creating a partition "2025_04" with smallPartsPath=".../data/small/2025_04",
-//	bigPartsPath=".../data/big/2025_04"
+// 注意：老集群升级后还存在 **legacy indexdb**，位于顶层 <storageDataPath>/indexdb/
+// （lib/storage/storage.go:275 legacyIDBPath；storage_legacy.go:232 legacyCreateSnapshot
+// 会把它链接进快照根），其下只有 prev/curr 两个 indexdb，目录名**不是** YYYY_MM。
+// 由于路径首段不是 "data"，Classify 会把它归为非分区路径，并由
+// -includeNonPartitioned=true 整体保留——这是正确行为：legacy indexdb 按
+// prev/curr 划分时间范围，无法按自然月切分，整体保留才能保证还原后索引完整。
 //
 // 这里把探测深度放宽到 3，是为了对“中间多插一层目录”的变体保持稳健：
 // 一旦某层目录名严格匹配 YYYY_MM，就认定为分区路径。

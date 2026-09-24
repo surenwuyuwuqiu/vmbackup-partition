@@ -30,6 +30,7 @@ English &nbsp;|&nbsp; <a href="README_CN.md">简体中文</a>
 - [Reading the dryRun plan](#reading-the-dryrun-plan)
 - [Backup layout](#backup-layout)
 - [Restore & verify](#restore--verify)
+- [Cluster restore: do you need another cluster?](#cluster-restore-do-you-need-another-cluster)
 - [Cluster backup](#cluster-backup)
 - [Production backup SOP](#production-backup-sop)
 - [Handling multi-batch accumulation](#handling-multi-batch-accumulation)
@@ -67,7 +68,7 @@ VictoriaMetrics single-node or cluster (verified on v1.150.0) when you need to b
 
 ### Storage layout
 
-VictoriaMetrics v1.150.0 on-disk layout:
+VictoriaMetrics v1.150.0 on-disk layout (**modern layout**):
 
 ```
 <storageDataPath>/
@@ -81,10 +82,25 @@ VictoriaMetrics v1.150.0 on-disk layout:
     └── metadata/                      ← a real directory
 ```
 
-Two facts matter here:
+**Clusters upgraded from older versions carry a legacy layout alongside it**
+(this tool hit exactly that on its first production run):
+
+```
+<storageDataPath>/
+├── indexdb/                           ← legacy indexdb: at the TOP level, not under data/
+│   ├── <prevIdbName>/
+│   └── <currIdbName>/                 ← directory names are internal IDs, not YYYY_MM
+└── data/{small,big}/<YYYY_MM>/…       ← data parts stay month-partitioned
+```
+
+**So `data/indexdb` may simply not exist, and `ls data/` shows only `small` and `big`.
+That is not a missing backup, and it is not an error.**
+
+Three facts matter here:
 
 - The partition directory name is produced by `timestampToPartitionName()` in `lib/storage/time.go` as `t.Format("2006_01")`, strictly equivalent to `YYYY_MM`
 - Part directory names are 16-hex-digit IDs and **cannot be confused** with the 7-character `YYYY_MM` format, so deciding "which month is this?" by directory name is safe and deterministic
+- The legacy indexdb is linked into the snapshot **top level** by `legacyCreateSnapshot()` in `storage_legacy.go`; its directory names are not `YYYY_MM` and cannot be split by calendar month, so this tool keeps it **wholesale as non-partitioned content** to keep the restored index complete
 
 ### Exactly one filter point
 
@@ -132,7 +148,7 @@ chmod +x vmbackup-partition-linux-amd64
 sudo mv vmbackup-partition-linux-amd64 /usr/local/bin/vmbackup-partition
 
 vmbackup-partition -version
-# vmbackup-partition v1.0.0 based-on VictoriaMetrics v1.150.0
+# vmbackup-partition v1.0.1 based-on VictoriaMetrics v1.150.0
 ```
 
 Other platforms are not pre-built yet — build from source (see below).
@@ -333,6 +349,34 @@ victoria-metrics -storageDataPath=/var/lib/victoria-metrics-restored -httpListen
 > If the target node already holds the current month, restoring deletes the months absent from the backup.
 > Use an empty directory when importing into a new cluster; back up the existing directory first if you must keep it.
 
+### Restoring costs one full copy — but verification can be space-free
+
+`vmrestore` writes every part from `-src` **physically** into `-storageDataPath`: no hard links,
+no deduplication, no incremental transfer. **Restoring an X GB backup requires another X GB of free
+space.** The exact figure is `bytes_kept` in the backup audit file (or `total_kept.human_bytes` of the
+dryRun plan).
+
+If you only want to **verify the backup works** without spending another full copy: the backup directory
+**is already a standard vmstorage layout** (`data/{small,big}`, `indexdb/`, `metadata/`), so a hard-link
+clone on the same filesystem lets the single-node binary load it directly:
+
+```bash
+# must be on the same filesystem; hard links cost no extra space (du shows two copies, df does not grow)
+cp -al /path/to/backup /path/to/verify-clone
+
+victoria-metrics -storageDataPath=/path/to/verify-clone \
+  -httpListenAddr=:18428 -retentionPeriod=100y
+
+# once verified: remove only the clone, the backup itself is untouched
+rm -rf /path/to/verify-clone
+```
+
+> Warning: **never run VM directly against the backup directory** — VM writes metadata/cache into it,
+> and retention deletes partitions during background merges, which would destroy your backup.
+> The hard-link clone is exactly what protects it: even if partitions vanish inside the clone,
+> only that clone's directory entries are removed, while the backup's own entries still point
+> to the same inodes.
+
 ### Post-restore checklist
 
 ```bash
@@ -341,7 +385,9 @@ find <restoredDataPath>/data -maxdepth 2 -mindepth 2 -type d | sort
 #    expected: only 2026_02 … 2026_06
 
 # 2. Confirm the month label carries only the selected months
-curl -s 'http://localhost:8428/api/v1/label/month/values' | jq
+#    NOTE: this endpoint defaults to a recent time window; historical months return an empty
+#    array unless you pass start/end explicitly
+curl -s 'http://localhost:8428/api/v1/label/month/values?start=1677600000&end=1782000000' | jq
 #    expected: "data": ["2026_02","2026_03","2026_04","2026_05","2026_06"]
 
 # 3. Confirm excluded months really hold no data
@@ -349,9 +395,71 @@ curl -s 'http://localhost:8428/api/v1/query?query=count({month="2026_01"})' | jq
 #    expected: result is an empty array
 ```
 
+## Cluster restore: do you need another cluster?
+
+**Short answer: only a disaster recovery of the whole cluster requires building one.** But first,
+accept one premise.
+
+VictoriaMetrics cluster is **shared nothing**: `vminsert` shards data by **consistent hashing over
+the metric name and all its labels**:
+
+> "`vminsert` - accepts the ingested data and spreads it among `vmstorage` nodes according to
+> consistent hashing over metric name and all its labels"
+
+So **a single vmstorage's backup is only one shard of the full time-series set**, not the full data.
+To recover the complete history you need a backup from **every** vmstorage node — the official docs
+say exactly that:
+
+> "To make a complete backup for VictoriaMetrics cluster, `vmbackup` must be run on **each** `vmstorage`
+> node in cluster. Backups must be placed into **different directories** on the remote storage in order
+> to avoid conflicts between backups from different nodes."
+
+Three restore shapes:
+
+| Shape | New cluster needed | Use case | Data you get |
+|---|---|---|---|
+| **A. Single-node load** | No | Offline verification that the backup works | Only this node's shard (≈ 1/N) |
+| **B. Attach to the live cluster** | No | Make historical data queryable in the running cluster | This node's shard |
+| **C. Rebuild the cluster** | Yes | Disaster recovery | Full data (needs every node's backup) |
+
+**Shape A**: the official single-node binary embeds the vmstorage capability, so it can load the
+restored directory directly. The limitation: you only see the series sharded onto that node —
+never treat it as the full dataset.
+
+**Shape B**: no new cluster required. Restore into a new vmstorage node, then add its address to the
+existing **`vmselect` `-storageNode`** list and the historical data becomes queryable immediately.
+The official Rebalancing section says exactly this:
+
+> "To pass only new `vmstorage` addresses to `-storageNode` command-line flag at `vminsert` nodes,
+> while passing all the `vmstorage` addresses to `-storageNode` command-line flag at `vmselect` nodes.
+> This enables writing new data only to new `vmstorage` nodes, while historical data from old
+> `vmstorage` nodes remain available for querying via `vmselect` together with the newly ingested data."
+
+A practical trick follows from the same sentence: **add the node to `vmselect` only, not to
+`vminsert`**, and you get a "read-only historical node" — queryable, but it receives no new writes.
+The cost is one machine with disk space equal to the backup; and since VictoriaMetrics does
+**no automatic rebalancing**, historical data never migrates on its own — which is exactly why
+this works.
+
+**Shape C**: requires every node's backup, restored node-by-node into the corresponding node,
+then the cluster is rebuilt following the official steps.
+
 ## Cluster backup
 
 In VictoriaMetrics cluster mode **every vmstorage's data is independent**, so you must back up per node and write to a **separate destination directory per node**.
+
+**Remember: a single node's backup is not the full data.** `vminsert` shards by consistent hashing
+over the metric name and all its labels, and the nodes share nothing and never talk to each other —
+so each node holds only a subset of the full time-series set. **Back up one node and you can only
+ever restore 1/N of the data.**
+
+Official wording (<https://docs.victoriametrics.com/victoriametrics/vmbackup/>):
+
+> "To make a complete backup for VictoriaMetrics cluster, `vmbackup` must be run on **each** `vmstorage` node in cluster.
+> Backups must be placed into **different directories** on the remote storage in order to avoid conflicts between backups from different nodes."
+
+For whether a restore requires rebuilding the cluster, see
+[Cluster restore: do you need another cluster?](#cluster-restore-do-you-need-another-cluster).
 
 ```bash
 bash scripts/backup-cluster.sh \
@@ -525,6 +633,27 @@ bash scripts/e2e-real.sh               # 69 checks
 ```
 
 Without `VMBIN`, the scripts skip the steps that depend on the official binaries and still run every other assertion.
+
+### Production run (anonymized)
+
+Beyond the end-to-end scripts, this tool has already completed one production backup on a real
+VictoriaMetrics cluster's `vmstorage` node (node names and paths are anonymized; the numbers are real):
+
+| Metric | Value |
+|---|---|
+| Backup range | `2025_03` ~ `2026_06` (that node's oldest data really does start at 2025_03) |
+| Kept parts / size | **5069 parts / 890,859,936,109 bytes (≈ 830 GiB)** |
+| Excluded parts / size | 694 parts / 16,375,958,510 bytes (= `2026_07`~`2026_09`, ≈ 15.3 GiB) |
+| Duration | ≈ 24 minutes (`-concurrency=10`, local `fs://` destination) |
+| Directory accounting | `du -sh` matches `bytes_kept` exactly, no unexplained delta |
+| Destination files | `backup_complete.ignore` + `backup_metadata.ignore` + `backup_month_range.ignore` + `data/{small,big}` + top-level `indexdb/` + `metadata/` |
+
+That run surfaced a **layout fact the docs had not covered**, now documented under
+[Storage layout](#storage-layout): the cluster was upgraded from an older version, so `indexdb` sits at
+the **top level** rather than under `data/`; `ls data/` shows only `small` and `big` while
+`data/indexdb` does not exist. That is not a missing backup — the legacy indexdb's directory names are
+not `YYYY_MM` and cannot be split by calendar month, so this tool keeps it wholesale as non-partitioned
+content to keep the restored index complete.
 
 ## In-depth documentation
 

@@ -65,8 +65,11 @@ var (
 	// 以下为本工具新增的参数
 	// ------------------------------------------------------------------
 	fromMonth = flag.String("fromMonth", "", "【必填】起始月份（闭区间），格式 YYYY_MM / YYYY-MM / YYYYMM。\n"+
-		"VictoriaMetrics 的存储数据按自然月切分为 data/<small|big|indexdb>/<YYYY_MM>/ 目录，\n"+
-		"本工具只备份落在 [fromMonth, toMonth] 区间内的分区。例如 -fromMonth=2026_02")
+		"VictoriaMetrics 的存储数据按自然月切分为 YYYY_MM 分区目录：\n"+
+		"  现代布局  data/<small|big|indexdb>/<YYYY_MM>/\n"+
+		"  老集群升级后 legacy indexdb 位于顶层 <storageDataPath>/indexdb/\n"+
+		"  （无法按自然月切分，本工具会将其整体保留）\n"+
+		"本工具只备份落在 [fromMonth, toMonth] 区间内的月份分区。例如 -fromMonth=2026_02")
 	toMonth               = flag.String("toMonth", "", "【必填】结束月份（闭区间），格式同 -fromMonth。例如 -toMonth=2026_06")
 	includeNonPartitioned = flag.Bool("includeNonPartitioned", true, "是否保留非月份分区文件（主要是 metadata/ 目录下的租户与索引元数据）。\n"+
 		"强烈建议保持默认值 true：这些文件体积很小，但缺失会导致还原后的存储元数据不完整")
@@ -303,8 +306,10 @@ vmbackup-partition 是 VictoriaMetrics 官方 vmbackup 的增强版：
 它保留了 vmbackup 的全部命令行参数、快照机制、备份格式与并发语义，
 额外支持只备份指定月份区间的分区数据。
 
-VictoriaMetrics 的存储数据按自然月切分为目录
-    <storageDataPath>/data/<small|big|indexdb>/<YYYY_MM>/<partID>/...
+VictoriaMetrics 的存储数据按自然月切分为目录：
+    现代布局  <storageDataPath>/data/<small|big|indexdb>/<YYYY_MM>/<partID>/...
+    legacy 布局  <storageDataPath>/indexdb/<...>（老集群升级后与现代布局并存，
+                 其目录名不是 YYYY_MM，无法按自然月切分，会被整体保留）
 本工具通过 -fromMonth / -toMonth 选定一个闭区间，只把区间内的月份分区写入目标端，
 区间外的月份（以及可选的非分区文件）不会出现在备份中。
 

@@ -30,6 +30,7 @@
 - [解读 dryRun 计划](#解读-dryrun-计划)
 - [备份产物结构](#备份产物结构)
 - [还原与验证](#还原与验证)
+- [集群还原要不要再搭一套集群](#集群还原要不要再搭一套集群)
 - [集群备份](#集群备份)
 - [生产备份 SOP](#生产备份-sop)
 - [多批月份累积处置](#多批月份累积处置)
@@ -67,7 +68,7 @@ VictoriaMetrics 单机版或集群版（v1.150.0 已验证），需要**只备�
 
 ### 存储布局
 
-VictoriaMetrics v1.150.0 的存储目录结构：
+VictoriaMetrics v1.150.0 的存储目录结构（**现代布局**）：
 
 ```
 <storageDataPath>/
@@ -81,10 +82,23 @@ VictoriaMetrics v1.150.0 的存储目录结构：
     └── metadata/                      ← 实体目录
 ```
 
-两条关键事实：
+**老集群升级后会并存一套 legacy 布局**（本工具在真实生产环境首次运行就遇到了）：
+
+```
+<storageDataPath>/
+├── indexdb/                           ← legacy 索引库：顶层，而不是 data/ 之下
+│   ├── <prevIdbName>/
+│   └── <currIdbName>/                 ← 目录名是内部 ID，不是 YYYY_MM
+└── data/{small,big}/<YYYY_MM>/…       ← 数据 part 仍按月分区
+```
+
+**因此 `data/indexdb` 可能根本不存在，`ls data/` 只会看到 `small` 和 `big` —— 这不是漏备，也不是备份出错。**
+
+三条关键事实：
 
 - 分区目录名由 `lib/storage/time.go` 的 `timestampToPartitionName()` 以 `t.Format("2006_01")` 产生，严格等价于 `YYYY_MM`
 - part 目录名是 16 位十六进制 ID，与 `YYYY_MM` 的 7 字符格式**不可能混淆**，因此按目录名判断月份是安全且确定的
+- legacy indexdb 由 `storage_legacy.go` 的 `legacyCreateSnapshot()` 链接进快照**顶层**，其目录名不是 `YYYY_MM`、无法按自然月切分；本工具会把它作为非分区内容**整体保留**，以保证还原后索引完整
 
 ### 过滤点只有一处
 
@@ -132,7 +146,7 @@ chmod +x vmbackup-partition-linux-amd64
 sudo mv vmbackup-partition-linux-amd64 /usr/local/bin/vmbackup-partition
 
 vmbackup-partition -version
-# vmbackup-partition v1.0.0 based-on VictoriaMetrics v1.150.0
+# vmbackup-partition v1.0.1 based-on VictoriaMetrics v1.150.0
 ```
 
 其他平台目前没有预编译产物，请从源码构建（见下文）。
@@ -333,6 +347,32 @@ victoria-metrics -storageDataPath=/var/lib/victoria-metrics-restored -httpListen
 > 若目标节点已在承载当前月数据，还原会删掉那些备份里没有的月份。
 > 导入新集群请使用空目录；需要保留现有数据时先备份该目录。
 
+### 还原要占一份**等量**空间 —— 但验证时可以零额外空间
+
+`vmrestore` 会把 `-src` 里的每个 part **实体写**到 `-storageDataPath`：不吃硬链接、不做去重、不是增量。
+**还原一份 X GB 的备份，就要再准备 X GB 的可用空间。** 需求量可直接用备份审计文件里的 `bytes_kept`
+（或 dryRun 的 `total_kept.human_bytes`）得出。
+
+如果只想**验证备份可用**而不想再占一份空间：备份目录本身**就是标准 vmstorage 存储布局**
+（`data/{small,big}`、`indexdb/`、`metadata/`），在同文件系统内做一次硬链接克隆，
+就能让单机二进制直接加载它：
+
+```bash
+# 必须与备份同文件系统；硬链接不占额外空间（du 会显示两份，df 不变）
+cp -al /path/to/backup /path/to/verify-clone
+
+victoria-metrics -storageDataPath=/path/to/verify-clone \
+  -httpListenAddr=:18428 -retentionPeriod=100y
+
+# 验证完成后：只删克隆，备份本体不受影响
+rm -rf /path/to/verify-clone
+```
+
+> ⚠️ **绝对不要让 VM 直接跑在备份目录上**——VM 会往里写 metadata/cache，
+> 且 retention 会在后台 merge 时删掉备份里的分区，等于亲手毁掉备份。
+> 硬链接克隆的意义正在于此：克隆里即使删了分区，也只是删掉该克隆的目录项，
+> 备份自己的目录项仍指向同一 inode，数据不受影响。
+
 ### 还原后的验证清单
 
 ```bash
@@ -341,7 +381,8 @@ find <restoredDataPath>/data -maxdepth 2 -mindepth 2 -type d | sort
 #    期望只列出 2026_02 … 2026_06
 
 # ② 查询数据，确认月份标签只含所选月份
-curl -s 'http://localhost:8428/api/v1/label/month/values' | jq
+#    注意：该接口默认只查最近时间窗，历史月份会返回空数组，必须显式传 start/end
+curl -s 'http://localhost:8428/api/v1/label/month/values?start=1677600000&end=1782000000' | jq
 #    期望："data": ["2026_02","2026_03","2026_04","2026_05","2026_06"]
 
 # ③ 确认被排除的月份确实无数据
@@ -349,9 +390,60 @@ curl -s 'http://localhost:8428/api/v1/query?query=count({month="2026_01"})' | jq
 #    期望：result 为空数组
 ```
 
+## 集群还原：要不要再搭一套集群？
+
+**结论：只有"整个集群都丢了"的灾难恢复才需要重建集群。** 但要先认清一个前提。
+
+VictoriaMetrics 集群是 **shared nothing** 架构，`vminsert` 按 metric name 与全部标签做**一致性哈希分片**：
+
+> "`vminsert` - accepts the ingested data and spreads it among `vmstorage` nodes according to
+> consistent hashing over metric name and all its labels"
+
+因此**单个 vmstorage 节点的备份，只是全量时间序列的一个分片**，不是全量数据。
+想完整取回历史，必须集群里**每一个** vmstorage 节点都各有备份——官方原文：
+
+> "To make a complete backup for VictoriaMetrics cluster, `vmbackup` must be run on **each**
+> `vmstorage` node in cluster. Backups must be placed into **different directories** on the
+> remote storage in order to avoid conflicts between backups from different nodes."
+
+三种还原形态：
+
+| 形态 | 需要新建集群 | 适用场景 | 能取到的数据 |
+|---|---|---|---|
+| **A. 单机加载** | 否 | 离线验证备份可用 | 仅该节点的分片（约 1/N） |
+| **B. 挂进现网** | 否 | 让现网能查到历史数据 | 该节点的分片 |
+| **C. 重建集群** | 是 | 灾难恢复 | 完整数据（需所有节点的备份） |
+
+**形态 A**：官方单机二进制内置 vmstorage 能力，直接加载还原出的目录即可查询。
+局限是只能看到该节点分到的序列，别把它当全量数据用。
+
+**形态 B**：不需要新建集群。把备份还原成一个新 vmstorage 节点，再把地址加到现有 **`vmselect` 的
+`-storageNode`**，历史数据立即可查。官方 Rebalancing 小节原文：
+
+> "To pass only new `vmstorage` addresses to `-storageNode` command-line flag at `vminsert` nodes,
+> while passing all the `vmstorage` addresses to `-storageNode` command-line flag at `vmselect` nodes.
+> This enables writing new data only to new `vmstorage` nodes, while historical data from old
+> `vmstorage` nodes remain available for querying via `vmselect` together with the newly ingested data."
+
+顺带一个实用技巧：**只加 `vmselect`、不加 `vminsert`，就得到一个"只读历史节点"**——能查、不接收新写入。
+代价是一台机器加一块与备份等量的磁盘；官方也明确**不做自动再平衡**，历史数据不会自己迁移，这正是这条路可行的原因。
+
+**形态 C**：必须所有节点的备份都在，逐节点还原到对应节点，再按官方步骤组集群。
+
 ## 集群备份
 
 VictoriaMetrics 集群版中**每个 vmstorage 的数据相互独立**，必须分节点备份、分节点写入**各自独立的目标目录**。
+
+**记住：单个节点的备份不是全量数据。** `vminsert` 按 metric name 与全部标签做一致性哈希分片，
+节点间 shared nothing、互不通信，所以每个节点只持有全量时间序列的一个子集。
+**只备一个节点，将来最多只能还原出 1/N 的数据。**
+
+官方原文（<https://docs.victoriametrics.com/victoriametrics/vmbackup/>）：
+
+> "To make a complete backup for VictoriaMetrics cluster, `vmbackup` must be run on **each** `vmstorage` node in cluster.
+> Backups must be placed into **different directories** on the remote storage in order to avoid conflicts between backups from different nodes."
+
+是否需要重建集群才能还原，见[集群还原：要不要再搭一套集群](#集群还原要不要再搭一套集群)。
 
 ```bash
 bash scripts/backup-cluster.sh \
@@ -525,6 +617,26 @@ bash scripts/e2e-real.sh               # 69 项
 ```
 
 未设置 `VMBIN` 时，脚本会跳过依赖官方二进制的步骤，其余断言照常执行。
+
+### 生产环境实测（匿名化）
+
+除端到端脚本外，本工具已在真实 VictoriaMetrics 集群的 `vmstorage` 节点上完成过一次生产备份
+（节点名/路径已匿名化，数据量与结论保持真实）：
+
+| 指标 | 值 |
+|---|---|
+| 备份区间 | `2025_03` ~ `2026_06`（该节点的数据起点即 2025_03） |
+| 保留 part / 体积 | **5069 part / 890,859,936,109 字节（约 830 GiB）** |
+| 排除 part / 体积 | 694 part / 16,375,958,510 字节（= `2026_07`~`2026_09`，约 15.3 GiB） |
+| 总耗时 | 约 24 分钟（`-concurrency=10`，目标端为本地 `fs://` 目录） |
+| 目录账目 | `du -sh` 与 `bytes_kept` 完全一致，无未解释差异 |
+| 目标端文件 | `backup_complete.ignore` + `backup_metadata.ignore` + `backup_month_range.ignore` + `data/{small,big}` + 顶层 `indexdb/` + `metadata/` |
+
+这次实跑暴露了一个**文档之前没覆盖的布局事实**，已在[原理 → 存储布局](#存储布局)里补上：
+该集群是老版本升级而来，`indexdb` 位于**顶层**而非 `data/` 之下，
+`ls data/` 只能看到 `small` 和 `big`，而 `data/indexdb` 不存在。
+这不是漏备——legacy indexdb 的目录名不是 `YYYY_MM`、无法按自然月切分，
+本工具把它作为非分区内容整体保留，以保证还原后索引完整。
 
 ## 深入文档
 
